@@ -415,10 +415,9 @@ impl<C: Connector> SubRequestClient<C> {
             peer = %peer.address,
             reused = session.reused(),
             method = %request.method,
-            // Path only: a URL-mode query string can carry a credential, so the
-            // query is never logged, but the path keeps explicit-peer sub-requests
-            // (health checks, AI callouts) debuggable.
-            path = request.uri.path(),
+            // URL-mode paths and queries can carry credentials. Prepared URL
+            // requests carry an internal marker that is stripped before send.
+            path = request_path_for_log(request),
             "sub-request: connected"
         );
 
@@ -945,6 +944,15 @@ impl<C: Connector> SubRequestClient<C> {
 // Request Assembly
 // -----------------------------------------------------------------------------
 
+/// Return the request path or a fixed label for a URL-bound target.
+fn request_path_for_log(request: &SubRequest) -> &str {
+    if request.headers.contains_key(crate::connectivity::URL_TARGET_MARKER) {
+        "<redacted>"
+    } else {
+        request.uri.path()
+    }
+}
+
 /// Build the sanitized request head: the method, the origin-form target, and
 /// the headers that may cross the sub-request boundary.
 ///
@@ -1279,6 +1287,18 @@ mod tests {
             "EAGER_BODY_CAPACITY should be 128 KiB in bytes"
         );
         assert_eq!(EAGER_BODY_CAPACITY, 128 * 1024, "EAGER_BODY_CAPACITY should be 128 KiB");
+    }
+
+    #[test]
+    fn direct_request_path_remains_visible_in_connection_event() {
+        let request = SubRequest {
+            method: http::Method::GET,
+            uri: http::Uri::from_static("/operator-health-path?query-is-never-logged"),
+            headers: HeaderMap::new(),
+            body: Bytes::new(),
+        };
+
+        assert_eq!(request_path_for_log(&request), "/operator-health-path");
     }
 
     #[test]

@@ -5,7 +5,7 @@
 
 use std::{
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
     },
     time::Duration,
@@ -14,8 +14,11 @@ use std::{
 use bytes::Bytes;
 use http::{HeaderMap, Version};
 
-use super::{SubRequest, SubRequestClient, SubRequestConnector, SubRequestError};
-use crate::egress::{Completion, Connector, EgressError, PeerSpec, RequestHead, ResponseHead, Session};
+use super::{StreamLimits, SubRequest, SubRequestClient, SubRequestConnector, SubRequestError};
+use crate::{
+    connectivity::{UrlResolutionPolicy, prepare_url_target_with_policy},
+    egress::{Completion, Connector, EgressError, PeerSpec, RequestHead, ResponseHead, Session},
+};
 
 /// Completion outcome independently reported by the fake transport.
 #[derive(Clone, Copy, Debug)]
@@ -39,6 +42,10 @@ struct Lifecycle {
     reused: AtomicUsize,
     /// Number of non-reusable releases.
     discarded: AtomicUsize,
+    /// Request targets handed to the transport.
+    sent_targets: Mutex<Vec<String>>,
+    /// Request headers handed to the transport.
+    sent_headers: Mutex<Vec<HeaderMap>>,
 }
 
 /// Backend reporting completion separately from EOF or header-time termination.
@@ -93,7 +100,19 @@ impl Session for FakeSession {
         false
     }
 
-    async fn send_request_head(&mut self, _head: RequestHead) -> Result<(), EgressError> {
+    async fn send_request_head(&mut self, head: RequestHead) -> Result<(), EgressError> {
+        self.connector
+            .lifecycle
+            .sent_headers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(head.headers);
+        self.connector
+            .lifecycle
+            .sent_targets
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(head.target);
         Ok(())
     }
 
@@ -139,6 +158,177 @@ impl Session for FakeSession {
     async fn shutdown(&mut self) {
         self.connector.lifecycle.shutdowns.fetch_add(1, Ordering::SeqCst);
     }
+}
+
+/// Capture fields from tracing events emitted during an exchange.
+#[derive(Clone, Default)]
+struct EventCapture(Arc<Mutex<Vec<(String, String)>>>);
+
+impl<S> tracing_subscriber::Layer<S> for EventCapture
+where
+    S: tracing::Subscriber + for<'lookup> tracing_subscriber::registry::LookupSpan<'lookup>,
+{
+    fn on_event(&self, event: &tracing::Event<'_>, _ctx: tracing_subscriber::layer::Context<'_, S>) {
+        struct Visitor<'fields>(&'fields mut Vec<(String, String)>);
+
+        impl tracing::field::Visit for Visitor<'_> {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                self.0.push((field.name().to_owned(), format!("{value:?}")));
+            }
+        }
+
+        let mut captured = self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        event.record(&mut Visitor(&mut captured));
+    }
+}
+
+/// URL execution must keep its wire target while suppressing it from logs.
+#[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "wire-target and tracing assertions share one exchange"
+)]
+#[expect(clippy::expect_used, reason = "fixed fake transport must complete successfully")]
+async fn url_execution_redacts_path_from_connection_event() {
+    use tracing_subscriber::layer::SubscriberExt as _;
+
+    const SECRET_PATH: &str = "PATH_BEARER_SECRET";
+    let lifecycle = Arc::new(Lifecycle::default());
+    let connector = FakeConnector {
+        header_done: true,
+        end_state: EndState::Finished,
+        lifecycle: Arc::clone(&lifecycle),
+    };
+    let client = SubRequestClient::new(SubRequestConnector::with_connector(connector, None, None));
+    let request = SubRequest {
+        method: http::Method::GET,
+        uri: http::Uri::default(),
+        headers: HeaderMap::new(),
+        body: Bytes::new(),
+    };
+    let capture = EventCapture::default();
+    let subscriber = tracing_subscriber::registry().with(capture.clone());
+    let _guard = tracing::subscriber::set_default(subscriber);
+    let url = format!("http://127.0.0.1:8080/{SECRET_PATH}/file?signature=QUERY_SECRET");
+
+    let response = client
+        .execute_url(
+            &url,
+            request,
+            |_| Ok(()),
+            UrlResolutionPolicy::ClientPerCall,
+            Duration::from_secs(5),
+            1024,
+            None,
+        )
+        .await
+        .expect("fake URL exchange should succeed");
+
+    assert_eq!(response.status, 200);
+    drop(response);
+    assert_eq!(
+        lifecycle
+            .sent_targets
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_slice(),
+        [format!("/{SECRET_PATH}/file?signature=QUERY_SECRET")],
+        "redaction must not alter the outbound request target"
+    );
+    assert!(
+        lifecycle
+            .sent_headers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .all(|headers| !headers.contains_key("x-praxis-url-target")),
+        "the internal URL marker must not cross the transport boundary"
+    );
+    let events = capture.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    assert!(
+        events
+            .iter()
+            .any(|(name, value)| name == "path" && value.contains("<redacted>")),
+        "connection event should contain a fixed redacted path: {events:?}"
+    );
+    assert!(
+        events.iter().all(|(_, value)| !value.contains(SECRET_PATH)),
+        "connection event must not contain the path credential: {events:?}"
+    );
+    drop(events);
+}
+
+/// Streaming a prepared URL must retain its wire target without logging it.
+#[tokio::test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "wire-target and tracing assertions share one exchange"
+)]
+#[expect(
+    clippy::expect_used,
+    reason = "fixed URL preparation and fake transport must succeed"
+)]
+async fn prepared_streaming_url_redacts_path_from_connection_event() {
+    use tracing_subscriber::layer::SubscriberExt as _;
+
+    const SECRET_PATH: &str = "STREAM_PATH_BEARER_SECRET";
+    let lifecycle = Arc::new(Lifecycle::default());
+    let connector = FakeConnector {
+        header_done: true,
+        end_state: EndState::Finished,
+        lifecycle: Arc::clone(&lifecycle),
+    };
+    let client = SubRequestClient::new(SubRequestConnector::with_connector(connector, None, None));
+    let request = SubRequest {
+        method: http::Method::GET,
+        uri: http::Uri::default(),
+        headers: HeaderMap::new(),
+        body: Bytes::new(),
+    };
+    let capture = EventCapture::default();
+    let subscriber = tracing_subscriber::registry().with(capture.clone());
+    let _guard = tracing::subscriber::set_default(subscriber);
+    let url = format!("http://127.0.0.1:8080/{SECRET_PATH}/file?signature=STREAM_QUERY_SECRET");
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let target = prepare_url_target_with_policy(&url, deadline, |_| Ok(()), UrlResolutionPolicy::ClientPerCall)
+        .await
+        .expect("fixed URL target should prepare");
+    let prepared = target.bind(request);
+    let peer = prepared.peer_at(0).expect("literal IP target should have one peer");
+    let limits = StreamLimits {
+        idle_timeout: Duration::from_secs(5),
+        max_stream_duration: None,
+        max_total_bytes: Some(1024),
+    };
+
+    let response = client
+        .send_streaming(&peer, prepared.request(), Duration::from_secs(5), limits, None)
+        .await
+        .expect("fake streaming URL exchange should succeed");
+
+    assert_eq!(response.status, 200);
+    drop(response);
+    assert_eq!(
+        lifecycle
+            .sent_targets
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_slice(),
+        [format!("/{SECRET_PATH}/file?signature=STREAM_QUERY_SECRET")],
+        "redaction must not alter the streaming outbound target"
+    );
+    let events = capture.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    assert!(
+        events
+            .iter()
+            .any(|(name, value)| name == "path" && value.contains("<redacted>")),
+        "streaming connection event should contain a fixed redacted path: {events:?}"
+    );
+    assert!(
+        events.iter().all(|(_, value)| !value.contains(SECRET_PATH)),
+        "streaming connection event must not contain the path credential: {events:?}"
+    );
+    drop(events);
 }
 
 /// Exercise both collection exits against all completion outcomes.
